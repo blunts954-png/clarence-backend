@@ -2,6 +2,6 @@ fastapi
 uvicorn
 selenium
 webdriver-manager
-beautifulsoup4
-openai
-python-dotenv
+jinja2
+pydantic
+requests
