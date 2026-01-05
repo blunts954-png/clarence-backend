@@ -1,25 +1,21 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from bs4 import BeautifulSoup
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 import time
 import json
-import random
 import os
-import re
-import openai
-from dotenv import load_dotenv
 
-# Initialize App
 app = FastAPI()
-load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# --- CORS ---
+# --- SETUP ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,136 +24,123 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DATA MODELS ---
+# Setup Templates (for the UI)
+templates = Jinja2Templates(directory="templates")
+
+# --- BLUEPRINTS (From your PDF) ---
+BLUEPRINTS = {
+    "Cars & Trucks": ["date", "title", "price", "dist", "link"],
+    "Housing": ["date", "title", "price", "housing", "link"],
+    "Jobs": ["date", "title", "link"],
+    "Services": ["date", "title", "link"]
+}
+
 class ScrapeRequest(BaseModel):
     target_url: str
-    data_blueprint: str
-    proxy_mode: bool = True
-    max_pages: int = 1 # New Parameter
+    blueprint: str
+    max_pages: int = 3
 
-# --- CORE LOGIC ---
-def get_proxy():
-    try:
-        if os.path.exists("proxies.txt"):
-            with open("proxies.txt", "r") as f:
-                proxies = [line.strip() for line in f if line.strip()]
-            return random.choice(proxies) if proxies else None
-    except:
-        pass
-    return None
-
-def setup_driver(use_proxy=False):
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.binary_location = "/usr/bin/chromium"
-
-    if use_proxy:
-        proxy = get_proxy()
-        if proxy:
-            chrome_options.add_argument(f'--proxy-server={proxy}')
-
-    service = Service("/usr/bin/chromedriver")
-    return webdriver.Chrome(service=service, options=chrome_options)
-
-def smart_scroll(driver):
-    # Aggressive Scroll to trigger all lazy loads
-    last_height = driver.execute_script("return document.body.scrollHeight")
-    for _ in range(5): 
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(1.5)
-
-def ai_analyze_page(html, blueprint):
-    """
-    Extracts Data AND the 'Next Page' link in one pass.
-    """
-    soup = BeautifulSoup(html, 'html.parser')
+def setup_driver():
+    options = Options()
+    options.add_argument("--headless=new") 
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36")
     
-    # Cleaning noise
-    for script in soup(["script", "style", "nav", "footer", "iframe"]):
-        script.decompose()
-        
-    # MASTER MODE: Increased limit to 50,000 chars to catch all 68 cars
-    text_content = soup.get_text(separator=' ', strip=True)[:50000]
+    # Auto-install ChromeDriver
+    service = Service(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service, options=options)
 
-    prompt = f"""
-    Task 1: Extract a list of items based on: {blueprint}.
-    Task 2: Find the "Next Page" or "Load More" URL if it exists.
-    
-    Return JSON format only:
-    {{
-        "items": [ {{...}}, {{...}} ],
-        "next_page_url": "FULL_URL_HERE_OR_NULL"
-    }}
-    
-    Text Source: {text_content}
-    """
-
-    try:
-        response = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={ "type": "json_object" }
-        )
-        return json.loads(response.choices[0].message.content)
-    except Exception as e:
-        return {"items": [], "next_page_url": None, "error": str(e)}
-
-# --- ENDPOINTS ---
 @app.get("/")
-def home():
-    return {"status": "Clarence 6.0 | Master Backend Online"}
+def home(request: Request):
+    # Serves the Dark Mode UI
+    return templates.TemplateResponse("index.html", {"request": request})
 
 @app.post("/scrape")
-async def run_scraper(request: ScrapeRequest):
-    print(f"Mission: {request.target_url} | Pages: {request.max_pages}")
+def run_scraper(request: ScrapeRequest):
+    print(f"--- INITIALIZING SIGNAL: {request.blueprint} ---")
+    print(f"Target: {request.target_url}")
     
     driver = None
-    all_items = []
-    current_url = request.target_url
-    pages_scraped = 0
+    all_data = []
     
     try:
-        driver = setup_driver(request.proxy_mode)
+        driver = setup_driver()
+        driver.get(request.target_url)
         
-        while pages_scraped < request.max_pages and current_url:
-            print(f"Scraping Page {pages_scraped + 1}: {current_url}")
+        current_page = 1
+        
+        while current_page <= request.max_pages:
+            print(f"Scanning Page {current_page}...")
             
-            driver.get(current_url)
-            smart_scroll(driver)
-            html = driver.page_source
+            # Wait for results to load
+            try:
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CLASS_NAME, "result-info"))
+                )
+            except:
+                print("No results found on this page.")
+                break
+
+            # SCRAPE ITEMS (CSS Selectors are faster and more reliable than AI here)
+            items = driver.find_elements(By.CLASS_NAME, "result-info")
+            print(f"Found {len(items)} items on page {current_page}.")
             
-            # AI Extraction
-            analysis = ai_analyze_page(html, request.data_blueprint)
+            for item in items:
+                try:
+                    # Universal Extraction based on Craigslist structure
+                    data = {}
+                    
+                    # Title & Link
+                    try:
+                        title_el = item.find_element(By.CLASS_NAME, "posting-title")
+                        data['title'] = title_el.text
+                        data['link'] = title_el.find_element(By.TAG_NAME, "a").get_attribute("href")
+                    except: continue
+
+                    # Price
+                    try:
+                        data['price'] = item.find_element(By.CLASS_NAME, "price").text
+                    except: data['price'] = "N/A"
+
+                    # Meta (Location/Odometer)
+                    try:
+                        data['meta'] = item.find_element(By.CLASS_NAME, "meta").text
+                    except: data['meta'] = ""
+
+                    all_data.append(data)
+                except:
+                    continue
             
-            # Collect Items
-            if "items" in analysis:
-                all_items.extend(analysis["items"])
-            
-            # Logic for Next Page
-            next_url = analysis.get("next_page_url")
-            
-            # Simple validation to ensure AI isn't hallucinating bad links
-            if next_url and next_url.startswith("http") and next_url != current_url:
-                current_url = next_url
+            # PAGINATION LOGIC
+            if current_page < request.max_pages:
+                try:
+                    # Look for the 'next' button
+                    next_button = driver.find_element(By.CLASS_NAME, "next")
+                    
+                    # Craigslist keeps the 'next' button but adds a "disabled" class if no pages left? 
+                    # Actually usually it just stops linking. We check standard behavior.
+                    if "disabled" in next_button.get_attribute("class"): 
+                        print("End of list reached.")
+                        break
+
+                    print("Clicking NEXT page...")
+                    driver.execute_script("arguments[0].click();", next_button)
+                    time.sleep(3) # Wait for load
+                    current_page += 1
+                except:
+                    print("Next button not found. Stopping.")
+                    break
             else:
-                current_url = None # Stop loop if no valid link
+                break
                 
-            pages_scraped += 1
-            time.sleep(1) # Be polite
-        
-        return {
-            "success": True, 
-            "pages_processed": pages_scraped,
-            "total_items": len(all_items),
-            "result": {"items": all_items}
-        }
-        
+        print(f"--- MISSION COMPLETE. Collected {len(all_data)} items. ---")
+        return {"status": "success", "count": len(all_data), "data": all_data}
+
     except Exception as e:
-        print(f"Error: {e}")
-        return {"success": False, "error": str(e)}
+        print(f"CRITICAL ERROR: {e}")
+        return {"status": "error", "message": str(e)}
+    
     finally:
         if driver:
             driver.quit()
