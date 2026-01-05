@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
 from bs4 import BeautifulSoup
 import time
 import json
@@ -18,10 +19,10 @@ app = FastAPI()
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# --- CORS (THE FIX FOR YOUR CONNECTION ERROR) ---
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows ALL sites to connect (secure enough for MVP)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,8 +31,9 @@ app.add_middleware(
 # --- DATA MODELS ---
 class ScrapeRequest(BaseModel):
     target_url: str
-    data_blueprint: str  # e.g., "Email, Phone, Name"
+    data_blueprint: str
     proxy_mode: bool = True
+    max_pages: int = 1 # New Parameter
 
 # --- CORE LOGIC ---
 def get_proxy():
@@ -61,27 +63,36 @@ def setup_driver(use_proxy=False):
     return webdriver.Chrome(service=service, options=chrome_options)
 
 def smart_scroll(driver):
+    # Aggressive Scroll to trigger all lazy loads
     last_height = driver.execute_script("return document.body.scrollHeight")
-    for _ in range(3): 
+    for _ in range(5): 
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(1)
+        time.sleep(1.5)
 
-def ai_extract(html, blueprint):
+def ai_analyze_page(html, blueprint):
     """
-    Uses OpenAI to find the specific data requested in the 'blueprint'
+    Extracts Data AND the 'Next Page' link in one pass.
     """
     soup = BeautifulSoup(html, 'html.parser')
     
-    # Clean up HTML to save tokens
-    for script in soup(["script", "style", "nav", "footer"]):
+    # Cleaning noise
+    for script in soup(["script", "style", "nav", "footer", "iframe"]):
         script.decompose()
-    text_content = soup.get_text(separator=' ', strip=True)[:15000] # Limit size
+        
+    # MASTER MODE: Increased limit to 50,000 chars to catch all 68 cars
+    text_content = soup.get_text(separator=' ', strip=True)[:50000]
 
     prompt = f"""
-    Extract data from this text based on these fields: {blueprint}.
-    Return a valid JSON object with a key "items" containing a list of objects.
-    If no data found, return empty list.
-    Text: {text_content}
+    Task 1: Extract a list of items based on: {blueprint}.
+    Task 2: Find the "Next Page" or "Load More" URL if it exists.
+    
+    Return JSON format only:
+    {{
+        "items": [ {{...}}, {{...}} ],
+        "next_page_url": "FULL_URL_HERE_OR_NULL"
+    }}
+    
+    Text Source: {text_content}
     """
 
     try:
@@ -92,28 +103,57 @@ def ai_extract(html, blueprint):
         )
         return json.loads(response.choices[0].message.content)
     except Exception as e:
-        return {"error": str(e), "items": []}
+        return {"items": [], "next_page_url": None, "error": str(e)}
 
 # --- ENDPOINTS ---
 @app.get("/")
 def home():
-    return {"status": "Clarence 6.0 Universal Backend Online"}
+    return {"status": "Clarence 6.0 | Master Backend Online"}
 
 @app.post("/scrape")
 async def run_scraper(request: ScrapeRequest):
-    print(f"Mission: {request.target_url}")
+    print(f"Mission: {request.target_url} | Pages: {request.max_pages}")
     
     driver = None
+    all_items = []
+    current_url = request.target_url
+    pages_scraped = 0
+    
     try:
         driver = setup_driver(request.proxy_mode)
-        driver.get(request.target_url)
-        smart_scroll(driver)
-        html = driver.page_source
         
-        # AI Analysis
-        data = ai_extract(html, request.data_blueprint)
+        while pages_scraped < request.max_pages and current_url:
+            print(f"Scraping Page {pages_scraped + 1}: {current_url}")
+            
+            driver.get(current_url)
+            smart_scroll(driver)
+            html = driver.page_source
+            
+            # AI Extraction
+            analysis = ai_analyze_page(html, request.data_blueprint)
+            
+            # Collect Items
+            if "items" in analysis:
+                all_items.extend(analysis["items"])
+            
+            # Logic for Next Page
+            next_url = analysis.get("next_page_url")
+            
+            # Simple validation to ensure AI isn't hallucinating bad links
+            if next_url and next_url.startswith("http") and next_url != current_url:
+                current_url = next_url
+            else:
+                current_url = None # Stop loop if no valid link
+                
+            pages_scraped += 1
+            time.sleep(1) # Be polite
         
-        return {"success": True, "url": request.target_url, "result": data}
+        return {
+            "success": True, 
+            "pages_processed": pages_scraped,
+            "total_items": len(all_items),
+            "result": {"items": all_items}
+        }
         
     except Exception as e:
         print(f"Error: {e}")
