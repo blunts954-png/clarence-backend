@@ -7,10 +7,13 @@ from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
 import time
 import os
-import random
-import re
+import logging
 
-# --- CONFIG ---
+# --- LOGGING SETUP ---
+# This ensures errors show up in your Render logs
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = FastAPI()
 
 # --- MODELS ---
@@ -26,29 +29,35 @@ def setup_driver():
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
-    # This path is specific to Render's Docker environment
-    chrome_options.binary_location = "/usr/bin/google-chrome" 
     
-    service = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service, options=chrome_options)
+    # SAFETY FIX: Removed hardcoded binary_location. 
+    # We let Selenium find Chrome automatically.
+    
+    try:
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        return driver
+    except Exception as e:
+        logger.error(f"Failed to initialize Chrome Driver: {e}")
+        raise e
 
 def clean_html(html):
     soup = BeautifulSoup(html, 'html.parser')
-    # Remove junk
     for x in soup(["script", "style", "nav", "footer", "noscript", "header"]):
         x.decompose()
-    # Get text
     text = soup.get_text(separator=' ', strip=True)
-    return text[:5000] # Limit to 5000 chars to save tokens/bandwidth
+    return text[:5000]
 
 # --- ENDPOINTS ---
 @app.get("/")
 def home():
-    return {"status": "Signal Backend Operational"}
+    return {"status": "Signal Backend Operational", "version": "Safe-Mode-1.0"}
 
 @app.post("/scrape")
 async def run_scraper(request: ScrapeRequest):
     driver = None
+    logger.info(f"Received scrape request for: {request.city} / {request.job_niche}")
+    
     try:
         # 1. URL Construction
         cat_map = {"jobs": "jjj", "gigs": "ggg", "for_sale": "sss"}
@@ -56,7 +65,10 @@ async def run_scraper(request: ScrapeRequest):
         url = f"https://{request.city}.craigslist.org/search/{cat_code}?query={request.job_niche.replace(' ', '+')}"
         
         # 2. Scrape
+        logger.info("Initializing Driver...")
         driver = setup_driver()
+        
+        logger.info(f"Navigating to {url}...")
         driver.get(url)
         
         # Simple scroll
@@ -66,15 +78,18 @@ async def run_scraper(request: ScrapeRequest):
         # 3. Extract
         raw_html = driver.page_source
         clean_text = clean_html(raw_html)
+        logger.info("Scrape successful.")
         
         # 4. Return
         return {
             "success": True,
             "target_url": url,
-            "result": clean_text  # Sending clean text to frontend
+            "result": clean_text
         }
 
     except Exception as e:
+        logger.error(f"Scrape Error: {str(e)}")
+        # This will return the actual error to your frontend instead of just crashing
         return {"success": False, "error": str(e)}
     
     finally:
