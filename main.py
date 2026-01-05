@@ -4,9 +4,11 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.core.os_manager import ChromeType
 from bs4 import BeautifulSoup
 import time
 import logging
+import shutil
 from fastapi.middleware.cors import CORSMiddleware
 
 # --- LOGGING & APP SETUP ---
@@ -15,10 +17,10 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# ENABLE CORS (So your Netlify site can talk to this)
+# ENABLE CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,25 +36,41 @@ def setup_driver():
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
-    # Masking automation flags
     chrome_options.add_argument("--disable-blink-features=AutomationControlled") 
     chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
+    # CRITICAL FIX: Point to the 'chromium' binary found in your error log
+    # We use shutil to find it dynamically so it works on Render and Local
+    binary_path = shutil.which("chromium") or shutil.which("google-chrome")
+    if binary_path:
+        chrome_options.binary_location = binary_path
+        logger.info(f"Binary found at: {binary_path}")
+
     try:
-        service = Service(ChromeDriverManager().install())
+        # CRITICAL FIX: Tell the manager to install the driver for CHROMIUM, not Chrome.
+        # This fixes the v114 vs v143 mismatch.
+        logger.info("Installing compatible driver for Chromium...")
+        service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
         driver = webdriver.Chrome(service=service, options=chrome_options)
         return driver
     except Exception as e:
-        logger.error(f"Driver Init Failed: {e}")
-        raise e
+        logger.error(f"Primary Driver Init Failed: {e}")
+        # Last Resort Fallback
+        try:
+             logger.info("Attempting fallback to standard Chrome...")
+             service = Service(ChromeDriverManager().install())
+             driver = webdriver.Chrome(service=service, options=chrome_options)
+             return driver
+        except Exception as e2:
+            logger.error(f"Fallback Driver Init Failed: {e2}")
+            raise e
 
 def clean_html_content(html):
     soup = BeautifulSoup(html, 'html.parser')
-    # Remove junk to save bandwidth
     for element in soup(["script", "style", "nav", "footer", "iframe", "noscript"]):
         element.decompose()
     text = soup.get_text(separator=' ', strip=True)
-    return text[:10000] # Return first 10k chars
+    return text[:10000]
 
 # --- ENDPOINTS ---
 @app.get("/")
@@ -68,7 +86,7 @@ async def universal_scraper(request: UniversalRequest):
         driver = setup_driver()
         driver.get(request.url)
         
-        # Smart Scroll (to trigger lazy loading)
+        # Smart Scroll
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
         time.sleep(1)
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
