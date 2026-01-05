@@ -1,23 +1,23 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 import time
+import re
+import os
 
 app = FastAPI()
 
-# --- CORS & TEMPLATES ---
+# --- PRODUCTION CORS ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # Allow all for now to prevent handshake errors
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -31,24 +31,69 @@ class ScrapeRequest(BaseModel):
     data_blueprint: str 
     max_pages: int = 1
 
-# --- CHROME SETUP ---
+# --- CHROME SETUP (HEADLESS SERVER MODE) ---
 def setup_driver():
     options = Options()
     options.add_argument("--headless=new") 
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    # Masking as a real user to avoid immediate blocking
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
+    
     service = Service(ChromeDriverManager().install())
     return webdriver.Chrome(service=service, options=options)
 
-# --- ROUTES ---
+# --- UNIVERSAL PARSER ---
+def extract_universal(element, blueprint_key):
+    text = element.text
+    data = {}
+    
+    # 1. Title Heuristics
+    try:
+        title_el = element.find_element(By.CSS_SELECTOR, "h1, h2, h3, h4, .title, .name, a.posting-title")
+        data['Title'] = title_el.text.strip()
+    except:
+        data['Title'] = text.split('\n')[0] if text else "Unknown"
+
+    # 2. Link Extraction
+    try:
+        link_el = element.find_element(By.TAG_NAME, "a")
+        data['Link'] = link_el.get_attribute("href")
+    except:
+        data['Link'] = "#"
+
+    # 3. Price Regex
+    price_match = re.search(r'\$[\d,]+', text)
+    data['Price'] = price_match.group(0) if price_match else "N/A"
+
+    # 4. Blueprint Specifics (From PDF Source 1)
+    if blueprint_key == "cars":
+        miles = re.search(r'(\d{1,3}(?:,\d{3})*)\s*(?:mi|miles)', text, re.IGNORECASE)
+        data['Odometer'] = miles.group(0) if miles else "N/A"
+        
+    elif blueprint_key == "housing":
+        beds = re.search(r'(\d+)\s*(?:br|bed)', text, re.IGNORECASE)
+        sqft = re.search(r'(\d{3,5})\s*(?:sq|ft)', text, re.IGNORECASE)
+        data['Specs'] = f"{beds.group(0) if beds else ''} {sqft.group(0) if sqft else ''}".strip()
+
+    elif blueprint_key == "jobs":
+        # Look for pay rates
+        comp = re.search(r'\$[\d,]+(?:\.\d+)?\s*(?:hr|hour|yr)', text, re.IGNORECASE)
+        data['Comp'] = comp.group(0) if comp else "N/A"
+
+    return data
+
+# --- ENDPOINTS ---
+
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 @app.post("/scrape")
 async def run_scraper(request: ScrapeRequest):
-    print(f"--- SIGNAL INITIATED: {request.target_url} ---")
+    print(f"--- SIGNAL LOCKED: {request.target_url} ---")
     
     driver = None
     all_items = []
@@ -56,85 +101,65 @@ async def run_scraper(request: ScrapeRequest):
     try:
         driver = setup_driver()
         driver.get(request.target_url)
+        time.sleep(3) # Cloud latency buffer
         
         current_page = 1
         
         while current_page <= request.max_pages:
-            print(f"Scanning Sector {current_page}...")
+            print(f"Scanning Page {current_page}...")
             
-            # Wait for content
-            try:
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CLASS_NAME, "result-info"))
-                )
-            except:
-                print("Signal weak/lost on this page.")
-                break
+            # UNIVERSAL SELECTOR STRATEGY
+            # 1. Try exact Craigslist class
+            candidates = driver.find_elements(By.CLASS_NAME, "result-info")
+            
+            # 2. If empty, try generic card classes
+            if not candidates:
+                for selector in [".card", ".item", "article", ".listing", ".result-item", "li.cl-static-search-result"]:
+                    found = driver.find_elements(By.CSS_SELECTOR, selector)
+                    if len(found) > 2:
+                        candidates = found
+                        break
+            
+            # 3. Last Resort: Divs with Links
+            if not candidates:
+                 # Find divs that contain "Price" or "$" and a Link
+                 candidates = driver.find_elements(By.XPATH, "//div[.//a and contains(., '$')]")[:40]
 
-            listings = driver.find_elements(By.CLASS_NAME, "result-info")
-            
-            for item in listings:
+            for item in candidates:
                 try:
-                    data = {}
+                    # Skip invisible/tiny elements
+                    if item.size['height'] < 20: continue
                     
-                    # 1. Universal Title/Link (Used for all blueprints)
-                    try:
-                        title_el = item.find_element(By.CLASS_NAME, "posting-title")
-                        data['Title'] = title_el.text
-                        data['Link'] = title_el.find_element(By.TAG_NAME, "a").get_attribute("href")
-                    except: 
-                        data['Title'] = "Unknown"
-                        data['Link'] = "#"
-
-                    # 2. Universal Price
-                    try:
-                        data['Price'] = item.find_element(By.CLASS_NAME, "price").text
-                    except: 
-                        data['Price'] = "N/A"
-
-                    # 3. Contextual Data (Based on Blueprint)
-                    meta_text = ""
-                    try:
-                        meta_text = item.find_element(By.CLASS_NAME, "meta").text
-                    except: pass
-
-                    if request.data_blueprint == "cars":
-                        data['Details'] = meta_text # Odometer/Location
-                    elif request.data_blueprint == "housing":
-                        data['Specs'] = meta_text # SqFt/Bedrooms
-                    elif request.data_blueprint == "jobs":
-                        data['Location'] = meta_text
-                    else:
-                        data['Info'] = meta_text
-
-                    all_items.append(data)
+                    extracted = extract_universal(item, request.data_blueprint)
+                    if len(extracted.get('Title', '')) > 2:
+                        all_items.append(extracted)
                 except:
                     continue
             
             # PAGINATION
             if current_page < request.max_pages:
                 try:
-                    next_button = driver.find_element(By.CLASS_NAME, "next")
-                    if "disabled" in next_button.get_attribute("class"): 
-                        break
-                    
-                    driver.execute_script("arguments[0].click();", next_button)
-                    time.sleep(2)
+                    # Generic "Next" button hunter
+                    next_btn = driver.find_element(By.XPATH, "//a[contains(translate(., 'NEXT', 'next'), 'next') or contains(., '>')]")
+                    driver.execute_script("arguments[0].click();", next_btn)
+                    time.sleep(3)
                     current_page += 1
                 except:
+                    print("Pagination end reached.")
                     break
             else:
                 break
-                
-        return {
+
+        return JSONResponse(content={
             "success": True, 
-            "pages_processed": current_page,
+            "count": len(all_items), 
             "result": { "items": all_items } 
-        }
+        })
 
     except Exception as e:
-        print(f"SYSTEM FAILURE: {e}")
-        return {"success": False, "error": str(e)}
+        print(f"CRITICAL FAILURE: {e}")
+        # Return JSON error to prevent frontend crash
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=200)
     
     finally:
         if driver:
