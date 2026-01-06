@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -9,11 +9,19 @@ from bs4 import BeautifulSoup
 import time
 import logging
 import shutil
+import os
+import json
+from openai import OpenAI
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 
-# --- LOGGING & APP SETUP ---
+# --- CONFIGURATION ---
+load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Initialize OpenAI (Requires OPENAI_API_KEY in Render Env Vars)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app = FastAPI()
 
@@ -26,12 +34,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- REQUEST MODELS ---
-class UniversalRequest(BaseModel):
+# --- DATA MODELS ---
+class SignalRequest(BaseModel):
     url: str
+    blueprint: str = "" # e.g. "Price, VIN, Mileage, Title Status"
+    proxy_mode: bool = False
+    ai_valuation: bool = False
 
 # --- CORE LOGIC ---
-def setup_driver():
+def setup_driver(proxy_mode=False):
     chrome_options = Options()
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
@@ -39,71 +50,96 @@ def setup_driver():
     chrome_options.add_argument("--disable-blink-features=AutomationControlled") 
     chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-    # CRITICAL FIX: Point to the 'chromium' binary found in your error log
-    # We use shutil to find it dynamically so it works on Render and Local
+    # In a real "Ghost Mode", you would inject proxy settings here
+    # if proxy_mode:
+    #   chrome_options.add_argument(f'--proxy-server={YOUR_PROXY_STRING}')
+
     binary_path = shutil.which("chromium") or shutil.which("google-chrome")
     if binary_path:
         chrome_options.binary_location = binary_path
-        logger.info(f"Binary found at: {binary_path}")
 
     try:
-        # CRITICAL FIX: Tell the manager to install the driver for CHROMIUM, not Chrome.
-        # This fixes the v114 vs v143 mismatch.
-        logger.info("Installing compatible driver for Chromium...")
         service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
         driver = webdriver.Chrome(service=service, options=chrome_options)
         return driver
     except Exception as e:
         logger.error(f"Primary Driver Init Failed: {e}")
-        # Last Resort Fallback
-        try:
-             logger.info("Attempting fallback to standard Chrome...")
-             service = Service(ChromeDriverManager().install())
-             driver = webdriver.Chrome(service=service, options=chrome_options)
-             return driver
-        except Exception as e2:
-            logger.error(f"Fallback Driver Init Failed: {e2}")
-            raise e
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        return driver
 
-def clean_html_content(html):
-    soup = BeautifulSoup(html, 'html.parser')
-    for element in soup(["script", "style", "nav", "footer", "iframe", "noscript"]):
-        element.decompose()
-    text = soup.get_text(separator=' ', strip=True)
-    return text[:10000]
+def analyze_with_ai(text_content, blueprint, do_valuation):
+    """
+    The Brain: Sends raw text to GPT-4o-mini to structure it.
+    """
+    if not blueprint:
+        return {"raw_text": text_content[:500]} # Fallback if no blueprint
+
+    # Construct the Prompt
+    system_prompt = "You are a data extraction engine. Output strictly JSON."
+    user_prompt = f"""
+    Analyze this text from a website listing:
+    "{text_content[:15000]}"
+    
+    TASK 1: Extract these specific fields: {blueprint}.
+    
+    TASK 2: { 'Provide a strict "Market Valuation" assessment (Underpriced/Overpriced) and estimated profit margin %.' if do_valuation else 'Ignore valuation.' }
+    
+    Return ONLY a JSON object with keys: "extracted_data" (object) and "valuation_analysis" (string).
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini", # Fast, cheap, smart enough
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            response_format={ "type": "json_object" }
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        logger.error(f"AI Analysis Failed: {e}")
+        return {"error": str(e)}
 
 # --- ENDPOINTS ---
 @app.get("/")
 def home():
-    return {"status": "Signal Universal Engine Online"}
+    return {"status": "SIGNAL INTELLIGENCE ONLINE", "clearance": "Top Secret"}
 
 @app.post("/scrape_universal")
-async def universal_scraper(request: UniversalRequest):
+async def signal_operation(request: SignalRequest):
     driver = None
-    logger.info(f"Targeting: {request.url}")
+    logger.info(f"SIGNAL LOCKED: {request.url}")
     
     try:
-        driver = setup_driver()
+        # 1. ACQUIRE
+        driver = setup_driver(request.proxy_mode)
         driver.get(request.url)
         
         # Smart Scroll
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
         time.sleep(1)
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(2)
+        time.sleep(1.5)
         
-        raw_html = driver.page_source
-        clean_text = clean_html_content(raw_html)
+        # 2. EXTRACT RAW
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        for x in soup(["script", "style", "nav", "footer", "iframe"]): x.decompose()
+        raw_text = soup.get_text(separator=' ', strip=True)
+        
+        # 3. ANALYZE (The $399 Feature)
+        logger.info("Engaging Neural Engine...")
+        ai_result = analyze_with_ai(raw_text, request.blueprint, request.ai_valuation)
         
         return {
             "success": True,
             "target": request.url,
-            "data_length": len(clean_text),
-            "result": clean_text
+            "result": ai_result # This is now structured JSON, not text
         }
 
     except Exception as e:
-        logger.error(f"Scrape Failed: {e}")
+        logger.error(f"Operation Failed: {e}")
         return {"success": False, "error": str(e)}
     
     finally:
