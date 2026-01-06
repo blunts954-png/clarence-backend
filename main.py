@@ -61,20 +61,21 @@ def analyze_with_ai(text_content, blueprint, do_valuation):
     if not blueprint:
         return {"extracted_data": [{"raw_text": text_content[:500]}]}
 
-    system_prompt = "You are a high-precision data scraper. Output strictly valid JSON."
+    system_prompt = "You are a database engine. Output strictly valid JSON."
     
-    # We explicitly ask for an ARRAY of items to make the CSV converter work perfectly
+    # STRICTER PROMPT: Demands uniform keys for CSV compatibility
     user_prompt = f"""
-    Analyze this raw text from a website:
-    "{text_content[:30000]}" 
+    Analyze this website text (Length: {len(text_content)} chars):
+    "{text_content[:28000]}" 
     
-    MISSION: Extract a clean LIST of items based on these fields: {blueprint}.
+    MISSION: Extract a LIST of items based on: {blueprint}.
     
-    REQUIREMENTS:
-    1. The output MUST be a JSON Object.
-    2. Key "extracted_data": An ARRAY of objects (e.g. [{{ "Title": "...", "Price": "..." }}]).
-    3. Key "valuation_analysis": A short string assessing market value (if Valuation is requested).
-    4. { 'Assess if items are Underpriced/Overpriced.' if do_valuation else 'Ignore valuation.' }
+    CRITICAL RULES:
+    1. Output JSON Object with key "extracted_data" (Array of Objects).
+    2. EVERY object in the array MUST have the exact same keys (e.g., if one has "Price", all must have "Price").
+    3. Use "N/A" for missing values. Do not omit keys.
+    4. Key "valuation_analysis": Short string (if requested).
+    5. { 'Assess market value/margin.' if do_valuation else 'Ignore valuation.' }
     """
 
     try:
@@ -93,7 +94,7 @@ def analyze_with_ai(text_content, blueprint, do_valuation):
 
 @app.get("/")
 def home():
-    return {"status": "SIGNAL READY", "version": "1.0-LAUNCH"}
+    return {"status": "SIGNAL READY", "version": "1.1-STABLE"}
 
 @app.post("/scrape_universal")
 async def signal_operation(request: SignalRequest):
@@ -104,7 +105,7 @@ async def signal_operation(request: SignalRequest):
         driver = setup_driver(request.proxy_mode)
         driver.get(request.url)
         
-        # Deep Scroll Logic
+        # Aggressive Scroll Logic
         for i in range(request.scan_depth):
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(2)
@@ -113,7 +114,6 @@ async def signal_operation(request: SignalRequest):
         for x in soup(["script", "style", "nav", "footer", "iframe", "svg"]): x.decompose()
         raw_text = soup.get_text(separator=' ', strip=True)
         
-        # AI Processing
         ai_result = analyze_with_ai(raw_text, request.blueprint, request.ai_valuation)
         
         return {
