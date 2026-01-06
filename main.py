@@ -15,7 +15,6 @@ from openai import OpenAI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
-# --- CONFIGURATION ---
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,15 +31,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DATA MODELS ---
 class SignalRequest(BaseModel):
     url: str
     blueprint: str = "" 
     proxy_mode: bool = False
     ai_valuation: bool = False
-    scan_depth: int = 1 # New Parameter (1 = Normal, 5 = Deep)
+    scan_depth: int = 1 
 
-# --- CORE LOGIC ---
 def setup_driver(proxy_mode=False):
     chrome_options = Options()
     chrome_options.add_argument("--headless")
@@ -55,29 +52,29 @@ def setup_driver(proxy_mode=False):
 
     try:
         service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        return driver
-    except Exception as e:
-        logger.error(f"Primary Driver Init Failed: {e}")
+        return webdriver.Chrome(service=service, options=chrome_options)
+    except:
         service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        return driver
+        return webdriver.Chrome(service=service, options=chrome_options)
 
 def analyze_with_ai(text_content, blueprint, do_valuation):
     if not blueprint:
-        return {"raw_text": text_content[:500]} 
+        return {"extracted_data": [{"raw_text": text_content[:500]}]}
 
-    system_prompt = "You are a data extraction engine. Output strictly JSON."
-    # We allow more text tokens now for deeper scans
+    system_prompt = "You are a high-precision data scraper. Output strictly valid JSON."
+    
+    # We explicitly ask for an ARRAY of items to make the CSV converter work perfectly
     user_prompt = f"""
-    Analyze this website text:
-    "{text_content[:25000]}" 
+    Analyze this raw text from a website:
+    "{text_content[:30000]}" 
     
-    TASK 1: Extract a LIST of items based on these fields: {blueprint}.
+    MISSION: Extract a clean LIST of items based on these fields: {blueprint}.
     
-    TASK 2: { 'Provide a strict "Market Valuation" (Underpriced/Overpriced) and estimated profit margin %.' if do_valuation else 'Ignore valuation.' }
-    
-    Return ONLY a JSON object with keys: "extracted_data" (array of objects) and "valuation_analysis" (string).
+    REQUIREMENTS:
+    1. The output MUST be a JSON Object.
+    2. Key "extracted_data": An ARRAY of objects (e.g. [{{ "Title": "...", "Price": "..." }}]).
+    3. Key "valuation_analysis": A short string assessing market value (if Valuation is requested).
+    4. { 'Assess if items are Underpriced/Overpriced.' if do_valuation else 'Ignore valuation.' }
     """
 
     try:
@@ -91,37 +88,32 @@ def analyze_with_ai(text_content, blueprint, do_valuation):
         )
         return json.loads(response.choices[0].message.content)
     except Exception as e:
-        logger.error(f"AI Analysis Failed: {e}")
-        return {"error": str(e)}
+        logger.error(f"AI Error: {e}")
+        return {"extracted_data": [], "error": str(e)}
 
-# --- ENDPOINTS ---
 @app.get("/")
 def home():
-    return {"status": "SIGNAL INTELLIGENCE ONLINE", "clearance": "Top Secret"}
+    return {"status": "SIGNAL READY", "version": "1.0-LAUNCH"}
 
 @app.post("/scrape_universal")
 async def signal_operation(request: SignalRequest):
     driver = None
-    logger.info(f"SIGNAL LOCKED: {request.url} (Depth: {request.scan_depth})")
+    logger.info(f"TARGET: {request.url} | DEPTH: {request.scan_depth}")
     
     try:
-        # 1. ACQUIRE
         driver = setup_driver(request.proxy_mode)
         driver.get(request.url)
         
-        # 2. DEEP SCROLL (Simulates Pagination)
-        # We scroll multiple times based on 'scan_depth'
+        # Deep Scroll Logic
         for i in range(request.scan_depth):
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1.5) # Wait for content to load
+            time.sleep(2)
             
-        # 3. EXTRACT
         soup = BeautifulSoup(driver.page_source, 'html.parser')
-        for x in soup(["script", "style", "nav", "footer", "iframe"]): x.decompose()
+        for x in soup(["script", "style", "nav", "footer", "iframe", "svg"]): x.decompose()
         raw_text = soup.get_text(separator=' ', strip=True)
         
-        # 4. ANALYZE
-        logger.info("Engaging Neural Engine...")
+        # AI Processing
         ai_result = analyze_with_ai(raw_text, request.blueprint, request.ai_valuation)
         
         return {
@@ -132,7 +124,7 @@ async def signal_operation(request: SignalRequest):
         }
 
     except Exception as e:
-        logger.error(f"Operation Failed: {e}")
+        logger.error(f"Fail: {e}")
         return {"success": False, "error": str(e)}
     
     finally:
