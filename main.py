@@ -20,12 +20,10 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize OpenAI (Requires OPENAI_API_KEY in Render Env Vars)
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app = FastAPI()
 
-# ENABLE CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,9 +35,10 @@ app.add_middleware(
 # --- DATA MODELS ---
 class SignalRequest(BaseModel):
     url: str
-    blueprint: str = "" # e.g. "Price, VIN, Mileage, Title Status"
+    blueprint: str = "" 
     proxy_mode: bool = False
     ai_valuation: bool = False
+    scan_depth: int = 1 # New Parameter (1 = Normal, 5 = Deep)
 
 # --- CORE LOGIC ---
 def setup_driver(proxy_mode=False):
@@ -49,10 +48,6 @@ def setup_driver(proxy_mode=False):
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled") 
     chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-    # In a real "Ghost Mode", you would inject proxy settings here
-    # if proxy_mode:
-    #   chrome_options.add_argument(f'--proxy-server={YOUR_PROXY_STRING}')
 
     binary_path = shutil.which("chromium") or shutil.which("google-chrome")
     if binary_path:
@@ -69,28 +64,25 @@ def setup_driver(proxy_mode=False):
         return driver
 
 def analyze_with_ai(text_content, blueprint, do_valuation):
-    """
-    The Brain: Sends raw text to GPT-4o-mini to structure it.
-    """
     if not blueprint:
-        return {"raw_text": text_content[:500]} # Fallback if no blueprint
+        return {"raw_text": text_content[:500]} 
 
-    # Construct the Prompt
     system_prompt = "You are a data extraction engine. Output strictly JSON."
+    # We allow more text tokens now for deeper scans
     user_prompt = f"""
-    Analyze this text from a website listing:
-    "{text_content[:15000]}"
+    Analyze this website text:
+    "{text_content[:25000]}" 
     
-    TASK 1: Extract these specific fields: {blueprint}.
+    TASK 1: Extract a LIST of items based on these fields: {blueprint}.
     
-    TASK 2: { 'Provide a strict "Market Valuation" assessment (Underpriced/Overpriced) and estimated profit margin %.' if do_valuation else 'Ignore valuation.' }
+    TASK 2: { 'Provide a strict "Market Valuation" (Underpriced/Overpriced) and estimated profit margin %.' if do_valuation else 'Ignore valuation.' }
     
-    Return ONLY a JSON object with keys: "extracted_data" (object) and "valuation_analysis" (string).
+    Return ONLY a JSON object with keys: "extracted_data" (array of objects) and "valuation_analysis" (string).
     """
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini", # Fast, cheap, smart enough
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -110,32 +102,33 @@ def home():
 @app.post("/scrape_universal")
 async def signal_operation(request: SignalRequest):
     driver = None
-    logger.info(f"SIGNAL LOCKED: {request.url}")
+    logger.info(f"SIGNAL LOCKED: {request.url} (Depth: {request.scan_depth})")
     
     try:
         # 1. ACQUIRE
         driver = setup_driver(request.proxy_mode)
         driver.get(request.url)
         
-        # Smart Scroll
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-        time.sleep(1)
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(1.5)
-        
-        # 2. EXTRACT RAW
+        # 2. DEEP SCROLL (Simulates Pagination)
+        # We scroll multiple times based on 'scan_depth'
+        for i in range(request.scan_depth):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1.5) # Wait for content to load
+            
+        # 3. EXTRACT
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         for x in soup(["script", "style", "nav", "footer", "iframe"]): x.decompose()
         raw_text = soup.get_text(separator=' ', strip=True)
         
-        # 3. ANALYZE (The $399 Feature)
+        # 4. ANALYZE
         logger.info("Engaging Neural Engine...")
         ai_result = analyze_with_ai(raw_text, request.blueprint, request.ai_valuation)
         
         return {
             "success": True,
             "target": request.url,
-            "result": ai_result # This is now structured JSON, not text
+            "scan_depth": request.scan_depth,
+            "result": ai_result
         }
 
     except Exception as e:
